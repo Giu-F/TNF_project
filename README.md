@@ -1,10 +1,10 @@
-# TNF phosphoproteomics analysis
+# Phosphoproteomics analysis of HCT-116 cells treated with tumor necrosis factor (TNF)
 
 R/Quarto analysis accompanying:
 
 **LUBAC PUB domain interactions restrict Met1-linked ubiquitination to prevent embryonic lethality and immune pathology in mice**
 
-This repository contains the phosphoproteomics analysis of: HOIP KO HCT-116 human colon carcinoma cells,, reconstituted with HOIP WT or with HOIP(N102D), following TNF stimulation for 5 and 15 minutes.
+This repository contains the phosphoproteomics analysis of: HOIP KO HCT-116 human colon carcinoma cells, reconstituted with HOIP WT or with HOIP(N102D), following TNF stimulation for 5 and 15 minutes.
 
 ## Data
 
