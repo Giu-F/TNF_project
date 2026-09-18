@@ -1,0 +1,19 @@
+# Keep the repository limited to source code and documentation.
+
+# Data and analysis outputs
+data/
+outputs/
+
+# Quarto generated files
+.quarto/
+*_files/
+*_cache/
+
+# RStudio / R temporary files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Local temporary files
+.local-*

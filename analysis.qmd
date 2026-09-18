@@ -1,0 +1,891 @@
+---
+title: "TNF phosphoproteomics analysis"
+subtitle: "LUBAC PUB domain interactions restrict Met1-linked ubiquitination to prevent embryonic lethality and immune pathology in mice"
+author: "Giulia Franciosa"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+    embed-resources: true
+    fig-width: 8
+    fig-height: 6
+execute:
+  echo: true
+  warning: false
+  message: false
+  error: false
+  cache: false
+params:
+  input_file: "data/20241126_Report_PTM_pivot_GF (Pivot).tsv"
+  output_dir: "outputs"
+---
+
+# 1. Setup
+
+Phosphoproteomics analysis of TNF responses in HCT116 cells. See [README](README.md) for methods, installation and data access.
+
+```{r setup}
+
+# 1. Load required packages
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(stringr)
+library(tibble)
+library(DAPAR)
+library(limma)
+library(eulerr)
+library(KEGGREST)
+library(pheatmap)
+library(RColorBrewer)
+
+# 2. Load required functions
+source("R/make_long.R")
+source("R/prepare_heatmap.R")
+
+# 3. Define input and output paths
+input_file <- params$input_file
+output_dir <- params$output_dir
+plots_dir <- file.path(output_dir, "plots")
+
+# 4. Create output directories
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Load data
+
+Load the pivot report, keep human phosphosites and human entries with gene names and phospho-STY measurements.
+
+```{r load}
+
+# 1. Load data
+data <- fread(input_file)
+data <- as.data.frame(data)
+cat("Loaded data with", nrow(data), "rows")
+
+# 2. Filter data
+
+# Remove contaminants
+data <- data[data$PG.FastaFiles == "human_uniprotkb_reviewed_2024_05_24",]
+data <- data %>% select(-PG.FastaFiles)
+
+# Remove rows without a Gene name
+data <- data[data$PG.Genes != "",]
+
+# Keep Phospho
+data <- data[data$PTM.ModificationTitle == "Phospho (STY)",]
+data <- data %>% select(-PTM.ModificationTitle)
+```
+
+# 3. Shorten sample names
+
+```{r names}
+
+# 1. Remove ".raw.PTM.Quantity"
+colnames(data) <- gsub(".raw.PTM.Quantity", "", colnames(data))
+
+# 2. Remove text before "GF"
+colnames(data) <- gsub(".*HCT116_", "", colnames(data))
+```
+
+# 4. Convert quantities and apply log2
+
+Columns 10–81 contain the 72 measurements. Set values below 1 to NA, then log2-transform.
+
+```{r log2}
+
+# 1. Change quantity cols to numerical
+data[,10:81] <- sapply(data[,10:81], as.numeric)
+
+# 2. Replace all values < 1 with NA
+data[,10:81][data[,10:81] < 1] <- NA
+
+# 3. Log2 transformation
+data[,10:81] <- log2(data[,10:81])
+```
+
+# 5. Remove duplicates and the outlier run
+
+Remove duplicates and KO_Ctrl_05min_d1_1; the 71 remaining measurements are in columns 10–80.
+
+```{r clean}
+
+# 1. Remove duplicates
+# Keep rows with unique values in all columns except PG.Genes, PG.ProteinDescriptions, PG.ProteinNames, PTM.ProteinId, PTM.CollapseKey, PTM.FlankingRegion
+data <- data %>% distinct_at(vars(-PG.Genes, -PG.ProteinDescriptions, -PG.ProteinNames, -PTM.ProteinId, -PTM.CollapseKey, -PTM.FlankingRegion), .keep_all = TRUE)
+
+# 2. Remove outlier
+data <- data %>% select(-KO_Ctrl_05min_d1_1)
+
+cat("Filtered data to", nrow(data), "rows")
+
+# 3. Export data cleaned
+write.table(data, file.path(output_dir, "data_cleaned.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+# 6. Filter missing observations
+
+Require more than 50% observed values overall and at least four in one genotype–treatment group.
+
+```{r na-filter}
+
+# 1. Keep rows with more than 50% values present
+data_f <- data[rowSums(!is.na(data[,10:80])) > 0.5 * ncol(data[,10:80]),]
+
+col_KO_Ctrl <- grep("KO_Ctrl", colnames(data))
+col_KO_TNF <- grep("KO_TNF", colnames(data))
+col_WT_Ctrl <- grep("WT_Ctrl", colnames(data))
+col_WT_TNF <- grep("WT_TNF", colnames(data))
+col_ND_Ctrl <- grep("ND_Ctrl", colnames(data))
+col_ND_TNF <- grep("ND_TNF", colnames(data))
+
+# 2. Keep rows with at least 4 values in one condition
+data_f <- data_f[rowSums(!is.na(data_f[, col_KO_Ctrl])) >= 4 |
+                   rowSums(!is.na(data_f[, col_KO_TNF])) >= 4 |
+                   rowSums(!is.na(data_f[, col_WT_Ctrl])) >= 4 |
+                   rowSums(!is.na(data_f[, col_WT_TNF])) >= 4 |
+                   rowSums(!is.na(data_f[, col_ND_Ctrl])) >= 4 |
+                   rowSums(!is.na(data_f[, col_ND_TNF])) >= 4, ]
+
+cat("Filtered data to", nrow(data_f), "rows")
+
+# 3. Export data filtered
+write.table(data_f, file.path(output_dir, "data_filtered.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+# 7. Reshape the filtered data
+
+Reshape data_f to long format and recover sample labels for plotting.
+
+```{r long}
+
+long <- make_long(data_f)
+```
+
+# 8. Plot filtered distributions
+
+Inspect filtered log2 quantities before normalization.
+
+```{r boxplot}
+#| title: "Boxplot of filtered log2 quantities"
+
+ggplot(long, aes(x = Run, y = quantity, fill = treatment, color = genotype)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.9), alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("black", "darkgrey", "blue")) +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(y = "Log2 transformed quantity", fill = "Time point", x = NULL)
+
+# Save plot in pdf in the plots folder
+ggsave(
+  filename = file.path(plots_dir, "boxplot_filtered.pdf"),
+  width = 8,
+  height = 6
+)
+```
+
+# 9. Count detected phosphosites
+
+Count distinct phosphosites per run and plot group means with standard deviations.
+
+```{r count}
+#| title: "Bar plot of detected phosphosites"
+
+# 1. Count distinct phosphosites per run
+totcount <- long %>%
+  group_by(Run, genotype, treatment, tp) %>%
+  summarise(Count = n_distinct(PTM.CollapseKey), .groups = "drop")
+
+# 2. Mean and SD per genotype, treatment and time point
+meancount <- totcount %>%
+  group_by(genotype, treatment, tp) %>%
+  summarise(
+    Count = mean(Count),
+    sd = sd(Count),
+    .groups = "drop"
+  )
+
+# 3. Plot the mean and standard deviation in a bar plot
+ggplot(meancount, aes(x = treatment, y = Count, fill = tp)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.5) +
+  geom_errorbar(aes(ymin = Count - sd, ymax = Count + sd), position = position_dodge(width = 0.9), width = 0.25) +
+  geom_text(aes(label = round(Count, 1)), vjust = -3, position = position_dodge(width = 0.9), size=2) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(y = "Number of localized phosphosites", fill = "Time point") +
+  facet_grid(~ genotype) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0, 15000, 2000))
+
+# Save plot in pdf in the plots folder
+ggsave(
+  filename = file.path(plots_dir, "barplot_filtered.pdf"),
+  width = 8,
+  height = 6
+)
+```
+
+# 10. Normalize after filtering
+
+Median-center log2 quantities with DAPAR; no imputation.
+
+```{r norm}
+
+# 1. Normalize data after filtering
+norm <- QuantileCentering(
+  data_f[,10:80],
+  conds = NULL,
+  type = "overall",
+  quantile = 0.5
+)
+norm <- as.data.frame(norm)
+norm <- cbind(data_f[,1:9], norm)
+
+# 2. Export normalized data
+write.table(norm, file.path(output_dir, "data_filtered_norm.txt"), sep = "\t", quote = F, row.names = F)
+```
+
+# 11. Reshape the normalized data to long format
+
+```{r long-norm}
+
+long <- make_long(norm)
+```
+
+# 12. Plot normalized distributions
+
+Inspect quantities after median centering.
+
+```{r boxplot-norm}
+#| title: "Boxplot of normalized log2 quantities after median centering"
+
+ggplot(long, aes(x = Run, y = quantity, fill = treatment, color = genotype)) +
+  geom_boxplot(outlier.shape = NA, position = position_dodge(width = 0.9), alpha = 0.5, lwd = 0.5) +
+  scale_color_manual(values = c("black", "darkgrey", "blue")) +
+  theme_minimal(base_size = 8) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+  labs(y = "Log2 transformed normalized quantity", fill = "Time point", x = NULL)
+
+# Save plot in pdf in the plots folder
+ggsave(
+  filename = file.path(plots_dir, "boxplot_filtered_norm.pdf"),
+  width = 8,
+  height = 6
+)
+```
+
+# 13. Fit limma and specify contrasts
+
+Fit the group means and 14 contrasts, without replicate blocking.
+
+```{r limma}
+
+# 1. Remove the last 5 characters from column names
+group <- substr(colnames(norm[,10:80]), 1, nchar(colnames(norm[,10:80]))-5)
+unique(group)
+
+# 2. Design matrix
+design <- model.matrix(~0 + group)
+colnames(design) <- gsub("group", "", colnames(design))
+
+# 3. Fit limma
+fit <- lmFit(norm[,10:80], design)
+
+# 4. Specify contrasts
+cont.matrix <- makeContrasts(
+  WT_5min = WT_TNF_05min - WT_Ctrl_05min,
+  WT_15min = WT_TNF_15min - WT_Ctrl_15min,
+  KO_5min = KO_TNF_05min - KO_Ctrl_05min,
+  KO_15min = KO_TNF_15min - KO_Ctrl_15min,
+  ND_5min = ND_TNF_05min - ND_Ctrl_05min,
+  ND_15min = ND_TNF_15min - ND_Ctrl_15min,
+  KO_WT_5min = KO_Ctrl_05min - WT_Ctrl_05min,
+  KO_WT_15min = KO_Ctrl_15min - WT_Ctrl_15min,
+  ND_WT_5min = ND_Ctrl_05min - WT_Ctrl_05min,
+  ND_WT_15min = ND_Ctrl_15min - WT_Ctrl_15min,
+  KO_WT_TNF_5min = KO_TNF_05min - WT_TNF_05min,
+  KO_WT_TNF_15min = KO_TNF_15min - WT_TNF_15min,
+  ND_WT_TNF_5min = ND_TNF_05min - WT_TNF_05min,
+  ND_WT_TNF_15min = ND_TNF_15min - WT_TNF_15min,
+  levels = design
+)
+
+# 5. Fit contrasts and compute moderated t-statistics
+fit2 <- contrasts.fit(fit, cont.matrix)
+fit3 <- eBayes(fit2, trend = T)
+```
+
+# 14. Collect results and label regulation
+
+Collect limma results and classify regulation using adjusted p-values and fold-change thresholds; see README.
+
+```{r limma-results}
+
+# 1. List of contrasts
+coefficients <- c(
+  "WT_5min",
+  "WT_15min",
+  "KO_5min",
+  "KO_15min",
+  "ND_5min",
+  "ND_15min",
+  "KO_WT_5min",
+  "KO_WT_15min",
+  "ND_WT_5min",
+  "ND_WT_15min",
+  "KO_WT_TNF_5min",
+  "KO_WT_TNF_15min",
+  "ND_WT_TNF_5min",
+  "ND_WT_TNF_15min"
+)
+
+# 2. Initialize an empty list to store the results for each contrast
+tabs <- list()
+
+# 3. Loop through each contrast, extract the top table, and classify regulation
+for (i in coefficients) {
+  tab <- topTable(fit3, coef = i, number = Inf, sort.by = "none")
+  tab$contrast <- i
+  tab <- cbind(norm[,1:9], tab)
+  tab <- tab %>%
+    mutate(
+      Regulation = case_when(
+        logFC > 2*sd(tab$logFC[tab$logFC > 0], na.rm = T) & adj.P.Val <= 0.01 ~ "Up-regulated",
+        logFC < -(2*sd(tab$logFC[tab$logFC > 0], na.rm = T)) & adj.P.Val <= 0.01 ~ "Down-regulated",
+        TRUE ~ "Unchanged"
+      )
+    )
+  tabs[[i]] <- tab
+}
+
+# 4. Combine all results into a single data frame
+limma <- do.call(rbind, tabs)
+
+# 5. Export limma results
+write.table(limma, file.path(output_dir, "limma.txt"), sep = "\t", quote = F, row.names = F)
+
+# 6. Density plot of Log2 fc distributions
+ggplot(limma, aes(x = logFC, color = contrast)) +
+  geom_density(alpha = 0.5) +
+  theme_minimal(base_size = 12) +
+  ggtitle("Density plot of Log2 fold-change distributions")
+```
+
+# 15. Count regulated sites
+
+Count regulated phosphosites using both the stringent cutoff defined in Step 14 and BH-adjusted p ≤ 0.05.
+
+```{r count-reg}
+#| title: "Bar plot of regulated phosphosites"
+
+# 1. Count regulated sites using the stringent cutoff defined in Step 14
+count_stringent <- limma %>%
+  group_by(contrast, Regulation) %>%
+  summarise(
+    Count = n_distinct(PTM.CollapseKey),
+    .groups = "drop"
+  ) %>%
+  mutate(Cutoff = "Stringent")
+
+# 2. Count regulated sites using adjusted p-value <= 0.05
+count_padj <- limma %>%
+  mutate(
+    Regulation = case_when(
+      adj.P.Val <= 0.05 & logFC > 0 ~ "Up-regulated",
+      adj.P.Val <= 0.05 & logFC < 0 ~ "Down-regulated",
+      TRUE ~ "Unchanged"
+    )
+  ) %>%
+  group_by(contrast, Regulation) %>%
+  summarise(
+    Count = n_distinct(PTM.CollapseKey),
+    .groups = "drop"
+  ) %>%
+  mutate(Cutoff = "Padj <= 0.05")
+
+# 3. Combine counts
+count <- bind_rows(
+  count_stringent,
+  count_padj
+) %>%
+  mutate(
+    Regulation = factor(
+      Regulation,
+      levels = c("Up-regulated", "Down-regulated", "Unchanged")
+    ),
+    Cutoff = factor(
+      Cutoff,
+      levels = c("Padj <= 0.05", "Stringent")
+    )
+  )
+
+
+# 4. TNF response contrasts
+tnf_contrasts <- c(
+  "KO_5min", "KO_15min",
+  "WT_5min", "WT_15min",
+  "ND_5min", "ND_15min"
+)
+
+count_tnf <- count %>%
+  filter(contrast %in% tnf_contrasts) %>%
+  mutate(
+    contrast = factor(contrast, levels = tnf_contrasts)
+  )
+
+ggplot(
+  count_tnf %>% filter(Regulation != "Unchanged"),
+  aes(
+    x = contrast,
+    y = Count,
+    fill = Cutoff
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.9),
+    alpha = 0.7
+  ) +
+  geom_text(
+    aes(label = Count),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 2.5
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of regulated phosphosites",
+    fill = "Cutoff"
+  ) +
+  facet_wrap(~ Regulation)
+
+# Save plot in pdf in the plots folder
+ggsave(
+  filename = file.path(plots_dir, "bar_plot_tnf.pdf"),
+  width = 8,
+  height = 6
+)
+
+# 5. Genotype comparison contrasts
+genotype_contrasts <- c(
+  "KO_WT_5min", "KO_WT_15min",
+  "ND_WT_5min", "ND_WT_15min",
+  "KO_WT_TNF_5min", "KO_WT_TNF_15min",
+  "ND_WT_TNF_5min", "ND_WT_TNF_15min"
+)
+
+count_genotype <- count %>%
+  filter(contrast %in% genotype_contrasts) %>%
+  mutate(
+    contrast = factor(
+      contrast,
+      levels = genotype_contrasts
+    )
+  )
+
+ggplot(
+  count_genotype %>% filter(Regulation != "Unchanged"),
+  aes(
+    x = contrast,
+    y = Count,
+    fill = Cutoff
+  )
+) +
+  geom_col(
+    position = position_dodge(width = 0.9),
+    alpha = 0.7
+  ) +
+  geom_text(
+    aes(label = Count),
+    position = position_dodge(width = 0.9),
+    vjust = -0.5,
+    size = 2.5
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  labs(
+    x = NULL,
+    y = "Number of regulated phosphosites",
+    fill = "Cutoff"
+  ) +
+  facet_wrap(~ Regulation)
+
+# Save plot in pdf in the plots folder
+ggsave(
+  filename = file.path(plots_dir, "bar_plot_genotype.pdf"),
+  width = 8,
+  height = 6
+)
+```
+
+# 16. Plot overlap between genotypes
+
+Use stringent Regulation labels for the genotype-overlap plots.
+
+```{r overlap}
+
+# 1. Helper function to get regulated sites for a given contrast
+get_regulated_sites <- function(limma_results, contrast_name) {
+
+  limma_results %>%
+    filter(
+      contrast == contrast_name,
+      Regulation != "Unchanged"
+    ) %>%
+    distinct(PTM.CollapseKey) %>%
+    pull(PTM.CollapseKey)
+}
+
+# 2. Plot overlap of regulated phosphosites at 5 minutes
+overlap_5min <- list(
+  WT = get_regulated_sites(limma, "WT_5min"),
+  KO = get_regulated_sites(limma, "KO_5min"),
+  ND = get_regulated_sites(limma, "ND_5min")
+)
+
+# Create plot object
+euler_5min <- plot(
+  euler(overlap_5min),
+  quantities = TRUE,
+  fills = c("lightblue", "lightpink", "lightgreen"),
+  main = "Regulated phosphosites - 5 min"
+)
+
+# Save as PDF
+pdf(
+  file.path(plots_dir, "regulated_phosphosites_overlap_5min.pdf"),
+  width = 7,
+  height = 7
+)
+
+print(euler_5min)
+dev.off()
+
+# Display in QMD
+print(euler_5min)
+
+
+# 3. Plot overlap of regulated phosphosites at 15 minutes
+overlap_15min <- list(
+  WT = get_regulated_sites(limma, "WT_15min"),
+  KO = get_regulated_sites(limma, "KO_15min"),
+  ND = get_regulated_sites(limma, "ND_15min")
+)
+
+euler_15min <- plot(
+  euler(overlap_15min),
+  quantities = TRUE,
+  fills = c("lightblue", "lightpink", "lightgreen"),
+  main = "Regulated phosphosites - 15 min"
+)
+
+pdf(
+  file.path(plots_dir, "regulated_phosphosites_overlap_15min.pdf"),
+  width = 7,
+  height = 7
+)
+
+print(euler_15min)
+dev.off()
+print(euler_15min)
+```
+
+# 17. Heatmaps
+
+## 17.1 TNF-responsive phosphosites at 15 minutes
+
+Inclusion: |log2FC| > 1 AND BH-adjusted p < 0.05 for Ctrl vs TNF in at least one genotype.
+
+```{r hm-15min-padj-fc}
+#| title: "Heatmap of TNF-responsive phosphosites at 15 minutes"
+#| fig-width: 6
+#| fig-height: 10
+
+# 1. Select TNF-responsive phosphosites
+sites_15min_padj_fc <- limma %>%
+  filter(
+    contrast %in% c("WT_15min", "KO_15min", "ND_15min"),
+    Regulation != "Unchanged"
+  ) %>%
+  distinct(PTM.CollapseKey) %>%
+  pull(PTM.CollapseKey)
+
+cat("Number of TNF-responsive phosphosites at 15 minutes:", length(sites_15min_padj_fc), "\n")
+
+# 2. Prepare heatmap
+heatmap_15min_padj_fc <- prepare_heatmap(
+  long,
+  sites_15min_padj_fc,
+  "15min"
+)
+
+# 3. Plot the heatmap
+hm <- pheatmap(
+  heatmap_15min_padj_fc$matrix,
+  color = colorRampPalette(
+    rev(brewer.pal(n = 9, name = "RdBu"))
+  )(100),
+  breaks = seq(-2.5, 2.5, length.out = 101),
+  annotation_col = heatmap_15min_padj_fc$annotation,
+  show_rownames = FALSE,
+  cluster_cols = FALSE
+)
+
+# 4. Save heatmap
+pdf(
+  file.path(plots_dir, "heatmap_15min_padj_fc.pdf"),
+  width = 8,
+  height = 10
+)
+
+grid::grid.draw(hm$gtable)
+dev.off()
+```
+
+## 17.2 Genotype-dependent TNF-responsive phosphosites at 15 minutes
+
+Inclusion: |log2FC| > 1 AND Padj < 0.05 for Ctrl vs TNF in at least one genotype AND p < 0.05 for WT vs KO or WT vs N102D under TNF.
+
+```{r hm-15min-padj-fc-pval}
+#| title: "Heatmap of genotype-dependent TNF-responsive phosphosites at 15 minutes"
+#| fig-width: 6
+#| fig-height: 10
+
+# 1. Phosphosites different between WT and KO or N102D under TNF
+genotype_sites_15min <- limma %>%
+  filter(
+    contrast %in% c(
+      "KO_WT_TNF_15min",
+      "ND_WT_TNF_15min"
+    ),
+    P.Value < 0.05
+  ) %>%
+  distinct(PTM.CollapseKey) %>%
+  pull(PTM.CollapseKey)
+
+cat("Number of genotype-dependent phosphosites at 15 minutes:", length(genotype_sites_15min), "\n")
+
+# 2. Require both criteria
+sites_15min_padj_fc_pval <- intersect(
+  sites_15min_padj_fc,
+  genotype_sites_15min
+)
+
+cat("Number of genotype-dependent TNF-responsive phosphosites at 15 minutes:", length(sites_15min_padj_fc_pval), "\n")
+
+# 3. Prepare heatmap
+heatmap_15min_padj_fc_pval <- prepare_heatmap(
+  long,
+  sites_15min_padj_fc_pval,
+  "15min"
+)
+
+# 4. Plot the heatmap
+hm2 <- pheatmap(
+  heatmap_15min_padj_fc_pval$matrix,
+  color = colorRampPalette(
+    rev(brewer.pal(n = 9, name = "RdBu"))
+  )(100),
+  breaks = seq(-2.5, 2.5, length.out = 101),
+  annotation_col = heatmap_15min_padj_fc_pval$annotation,
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  cluster_cols = FALSE
+)
+
+# 5. Save heatmap
+pdf(
+  file.path(plots_dir, "heatmap_15min_padj_fc_pval.pdf"),
+  width = 8,
+  height = 10
+)
+
+grid::grid.draw(hm2$gtable)
+dev.off()
+```
+
+## 17.3 KEGG TNF and NF-κB pathway heatmap
+
+Inclusion: Padj < 0.05 for Ctrl vs TNF in at least one genotype AND gene annotated to the KEGG TNF or NF-κB pathways, with both 5 and 15 min.
+
+```{r heatmap-kegg-tnf-nfkb}
+#| title: "Heatmap of KEGG TNF and NF-κB pathway phosphosites"
+#| fig-width: 10
+#| fig-height: 10
+
+# 1. Retrieve genes from TNF and NF-kB KEGG pathways
+pathway_tnf <- keggGet("hsa04668")
+pathway_nfkb <- keggGet("hsa04064")
+
+genes_tnf <- pathway_tnf[[1]]$GENE
+genes_nfkb <- pathway_nfkb[[1]]$GENE
+
+gene_names_tnf <- genes_tnf[
+  seq(2, length(genes_tnf), by = 2)
+] %>%
+  sapply(function(x) strsplit(x, ";")[[1]][1])
+
+gene_names_nfkb <- genes_nfkb[
+  seq(2, length(genes_nfkb), by = 2)
+] %>%
+  sapply(function(x) strsplit(x, ";")[[1]][1])
+
+kegg_genes <- unique(
+  c(gene_names_tnf, gene_names_nfkb)
+)
+cat("Number of unique genes in KEGG TNF and NF-kB pathways:", length(kegg_genes), "\n")
+
+# 2. Select regulated phosphosites
+kegg_sites <- limma %>%
+  filter(adj.P.Val <= 0.05) %>%
+  distinct(PTM.CollapseKey) %>%
+  pull(PTM.CollapseKey)
+
+# 3. Prepare KEGG phosphosites for heatmap
+kegg_heatmap_data <- long %>%
+  mutate(
+    Gene = gsub(";.*", "", PG.Genes)
+  ) %>%
+  filter(
+    Gene %in% kegg_genes,
+    PTM.CollapseKey %in% kegg_sites
+  ) %>%
+  mutate(
+    id = paste0(
+      Gene, "_",
+      PTM.SiteAA, PTM.SiteLocation, "_",
+      PTM.Multiplicity
+    )
+  ) %>%
+  group_by(PTM.CollapseKey, id) %>%
+  mutate(
+    z = as.numeric(scale(quantity))
+  ) %>%
+  ungroup() %>%
+  group_by(
+    PTM.CollapseKey,
+    id,
+    genotype,
+    treatment,
+    tp,
+    rep
+  ) %>%
+  summarise(
+    z = mean(z, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    condition = paste0(
+      genotype, "_",
+      treatment, "_",
+      tp, "_",
+      rep
+    )
+  )
+
+# 4. Convert to wide format
+kegg_wide <- data.table::dcast(
+  as.data.table(kegg_heatmap_data),
+  id ~ condition,
+  value.var = "z"
+)
+cat("Number of KEGG phosphosites for heatmap:", nrow(kegg_wide), "\n")
+
+kegg_wide <- as.data.frame(kegg_wide)
+
+rownames(kegg_wide) <- kegg_wide$id
+kegg_wide$id <- NULL
+
+# 5. Order columns
+column_order <- c(
+  grep("^WT_", colnames(kegg_wide), value = TRUE),
+  grep("^KO_", colnames(kegg_wide), value = TRUE),
+  grep("^ND_", colnames(kegg_wide), value = TRUE)
+)
+
+kegg_wide <- kegg_wide[
+  ,
+  column_order,
+  drop = FALSE
+]
+
+# 6. Column annotations
+kegg_annotation <- data.frame(
+  Treatment = ifelse(
+    grepl("_TNF_", colnames(kegg_wide)),
+    "TNF",
+    "Ctrl"
+  ),
+  Genotype = case_when(
+    grepl("^WT_", colnames(kegg_wide)) ~ "WT",
+    grepl("^KO_", colnames(kegg_wide)) ~ "KO",
+    grepl("^ND_", colnames(kegg_wide)) ~ "ND"
+  ),
+  Time = case_when(
+    grepl("_5min_", colnames(kegg_wide)) ~ "5 min",
+    grepl("_15min_", colnames(kegg_wide)) ~ "15 min"
+  ),
+  row.names = colnames(kegg_wide)
+)
+
+kegg_annotation$Treatment <- factor(
+  kegg_annotation$Treatment,
+  levels = c("Ctrl", "TNF")
+)
+
+kegg_annotation$Genotype <- factor(
+  kegg_annotation$Genotype,
+  levels = c("WT", "KO", "ND")
+)
+
+kegg_annotation$Time <- factor(
+  kegg_annotation$Time,
+  levels = c("5 min", "15 min")
+)
+
+# 7. Plot heatmap
+kegg_plot <- pheatmap(
+  as.matrix(kegg_wide),
+  color = colorRampPalette(
+    rev(brewer.pal(n = 9, name = "RdBu"))
+  )(100),
+  breaks = seq(-2, 2, length.out = 101),
+  annotation_col = kegg_annotation,
+  show_rownames = TRUE,
+  fontsize_row = 8,
+  cluster_cols = FALSE
+)
+
+# 8. Save heatmap
+pdf(
+  file.path(plots_dir, "heatmap_TNF_NFkb_bio-rep.pdf"),
+  width = 8,
+  height = 10
+)
+
+grid::grid.draw(kegg_plot$gtable)
+dev.off()
+```
+
+# 18. Session information
+
+Save the input checksum, parameters and software versions with the local results.
+
+```{r session-info}
+writeLines(
+  capture.output(sessionInfo()),
+  file.path(output_dir, "sessionInfo.txt")
+)
+
+sessionInfo()
+```
